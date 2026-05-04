@@ -1,5 +1,5 @@
 ---
-title: 'MQTT Integration'
+title: 'MQTT Best Practice'
 description: 'WiCAN Pro to Home Assistant: The Ultimate MQTT Best Practices Guide'
 ---
 
