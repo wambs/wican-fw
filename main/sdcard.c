@@ -20,6 +20,7 @@
 #include "filesystem.h"
 #include "restart_tracker.h"
 #include "esp_log.h"
+#include "config_server.h"
 
 #define OTA_BUFFER_SIZE 4096  
 #define SDCARD_LOG_PATH SD_CARD_MOUNT_POINT "/wican.log"
@@ -81,6 +82,179 @@ static size_t sdcard_log_strip_ansi(char *output, size_t output_size,
     return output_len;
 }
 
+static bool sdcard_log_ci_prefix_match(const char *text, const char *label, size_t label_len)
+{
+    for (size_t i = 0; i < label_len; i++)
+    {
+        char a = text[i];
+        char b = label[i];
+        if (a == '\0') return false;
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) return false;
+    }
+    return true;
+}
+
+static char *sdcard_log_ci_find(const char *haystack, const char *needle)
+{
+    size_t needle_len = strlen(needle);
+    if (needle_len == 0) return NULL;
+    for (const char *p = haystack; *p != '\0'; p++)
+    {
+        if (sdcard_log_ci_prefix_match(p, needle, needle_len))
+        {
+            return (char *)p;
+        }
+    }
+    return NULL;
+}
+
+static const char *const SDCARD_LOG_SECRET_LABELS[] = {
+    "sta_pass:",
+    "ap_pass:",
+    "home_password:",
+    "drive_password:",
+    "ble_pass:",
+    "mqtt_pass:",
+    "batt_mqtt_pass:",
+    "batt_alert_pass:",
+    "ts_auth_key:",
+    "private_key:",
+    "preshared_key:",
+    "api_token:",
+    "api_key:",
+    "bearer:",
+    "basic_password:",
+    /* Not a credential, but a network address -- for a self-hosted VPN
+     * this reveals the router's public IP. Same protection mechanism,
+     * different category of sensitive data. */
+    "esp_wireguard: peer:",
+    "esp_wireguard: connecting to ",
+    "esp_wireguard: getaddrinfo: unable to resolve `",
+};
+#define SDCARD_LOG_SECRET_LABEL_COUNT (sizeof(SDCARD_LOG_SECRET_LABELS) / sizeof(SDCARD_LOG_SECRET_LABELS[0]))
+#define SDCARD_LOG_REDACTED_MARKER "***REDACTED***"
+
+/* Tries a literal case-insensitive match of `label` in `text`. If `label`
+ * ends in ':', also tries the JSON-quoted form ("field":...) for the same
+ * field name, since credential fields appear both in plain ESP_LOGx calls
+ * and in the raw config.json dump line. Labels that don't end in ':'
+ * (e.g. "esp_wireguard: connecting to ") are matched literally only --
+ * used for values that are never JSON-quoted, like a logged network
+ * endpoint rather than a config field. */
+static char *sdcard_log_find_value_start(char *text, const char *label, bool *is_json_quoted)
+{
+    *is_json_quoted = false;
+
+    size_t label_len = strlen(label);
+    bool try_json = (label_len > 1 && label[label_len - 1] == ':');
+
+    char *plain_match = sdcard_log_ci_find(text, label);
+    char *json_match = NULL;
+    char json_pattern[40];
+
+    if (try_json)
+    {
+        char field_name[32];
+        if (label_len - 1 < sizeof(field_name))
+        {
+            memcpy(field_name, label, label_len - 1);
+            field_name[label_len - 1] = '\0';
+            snprintf(json_pattern, sizeof(json_pattern), "\"%s\":", field_name);
+            json_match = sdcard_log_ci_find(text, json_pattern);
+        }
+    }
+
+    char *match;
+    const char *pattern;
+    if (json_match != NULL && (plain_match == NULL || json_match <= plain_match))
+    {
+        match = json_match;
+        pattern = json_pattern;
+        *is_json_quoted = true;
+    }
+    else if (plain_match != NULL)
+    {
+        match = plain_match;
+        pattern = label;
+        *is_json_quoted = false;
+    }
+    else
+    {
+        return NULL;
+    }
+
+    char *value_start = match + strlen(pattern);
+    if (*value_start == ' ')
+    {
+        value_start++;
+    }
+    if (*is_json_quoted && *value_start == '"')
+    {
+        value_start++;
+    }
+    return value_start;
+}
+
+static void sdcard_log_redact_secrets(char *text, size_t buf_size)
+{
+    size_t marker_len = strlen(SDCARD_LOG_REDACTED_MARKER);
+
+    for (size_t i = 0; i < SDCARD_LOG_SECRET_LABEL_COUNT; i++)
+    {
+        const char *label = SDCARD_LOG_SECRET_LABELS[i];
+        bool is_json_quoted = false;
+        char *search_ptr = text;
+
+        while ((search_ptr = sdcard_log_find_value_start(search_ptr, label, &is_json_quoted)) != NULL)
+        {
+            char *value_end;
+            if (is_json_quoted)
+            {
+                value_end = strchr(search_ptr, '"');
+            }
+            else
+            {
+                value_end = strchr(search_ptr, '\n');
+            }
+
+            if (value_end != NULL)
+            {
+                size_t tail_len = strlen(value_end) + 1;
+                if ((size_t)(search_ptr - text) + marker_len + tail_len <= buf_size)
+                {
+                    memmove(search_ptr + marker_len, value_end, tail_len);
+                    memcpy(search_ptr, SDCARD_LOG_REDACTED_MARKER, marker_len);
+                    search_ptr += marker_len;
+                }
+                else
+                {
+                    size_t secret_len = value_end - search_ptr;
+                    memset(search_ptr, '*', secret_len);
+                    search_ptr += secret_len;
+                }
+            }
+            else
+            {
+                if ((size_t)(search_ptr - text) + marker_len + 1 <= buf_size)
+                {
+                    memcpy(search_ptr, SDCARD_LOG_REDACTED_MARKER, marker_len);
+                    search_ptr[marker_len] = '\0';
+                    search_ptr += marker_len;
+                }
+                else
+                {
+                    size_t remaining = buf_size - (search_ptr - text) - 1;
+                    memset(search_ptr, '*', remaining);
+                    search_ptr[remaining] = '\0';
+                    break;
+                }
+            }
+        }
+    }
+}
+
 static FILE *sdcard_log_open(void)
 {
     FILE *file = fopen(SDCARD_LOG_PATH, "a");
@@ -98,6 +272,18 @@ static FILE *sdcard_log_open(void)
     }
 
     return file;
+}
+
+static void sdcard_log_delete_files(void)
+{
+    if (unlink(SDCARD_LOG_PATH) == 0)
+    {
+        ESP_LOGI(TAG, "Deleted %s (debug log disabled)", SDCARD_LOG_PATH);
+    }
+    if (unlink(SDCARD_LOG_BACKUP_PATH) == 0)
+    {
+        ESP_LOGI(TAG, "Deleted %s (debug log disabled)", SDCARD_LOG_BACKUP_PATH);
+    }
 }
 
 static void sdcard_log_task(void *arg)
@@ -186,8 +372,8 @@ static int sdcard_log_vprintf(const char *format, va_list args)
             }
             else
             {
-                entry->len = (uint16_t)(
-                    length < (int)sizeof(entry->text) ? length : sizeof(entry->text) - 1);
+                sdcard_log_redact_secrets(entry->text, sizeof(entry->text));
+                entry->len = (uint16_t)strnlen(entry->text, sizeof(entry->text) - 1);
                 if (xQueueSend(s_log_pending_queue, &index, 0) != pdTRUE)
                 {
                     (void)xQueueSend(s_log_free_queue, &index, 0);
@@ -565,14 +751,37 @@ esp_err_t sd_card_init(void)
 
     s_card_mounted = true;
     dev_status_set_bits(DEV_SDCARD_MOUNTED_BIT);
-    esp_err_t log_ret = sdcard_log_start();
-    if (log_ret != ESP_OK)
-    {
-        ESP_LOGW(TAG, "SD log capture unavailable: %s", esp_err_to_name(log_ret));
-    }
+    /* config.json hasn't been loaded yet at this point in boot -- sd_card_init()
+     * runs before config_server_preload_config(), so device_config.sdcard_debug_log_en
+     * isn't populated here and this decision can't be made correctly yet. See
+     * sdcard_apply_debug_log_config(), called later once config is actually loaded. */
     ESP_LOGI(TAG, "SD card mounted successfully");
     
     return ESP_OK;
+}
+
+esp_err_t sdcard_apply_debug_log_config(void)
+{
+    if (!s_card_mounted)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (config_server_get_sdcard_debug_log_en())
+    {
+        esp_err_t log_ret = sdcard_log_start();
+        if (log_ret != ESP_OK)
+        {
+            ESP_LOGW(TAG, "SD log capture unavailable: %s", esp_err_to_name(log_ret));
+        }
+        return log_ret;
+    }
+    else
+    {
+        ESP_LOGI(TAG, "SD debug logging disabled by config, skipping");
+        sdcard_log_delete_files();
+        return ESP_OK;
+    }
 }
 
 esp_err_t sd_card_deinit(void) 

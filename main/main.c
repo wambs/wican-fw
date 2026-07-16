@@ -767,6 +767,7 @@ void app_main(void)
 
 		restart_tracker_init();
 		config_server_preload_config((char*)&uid[0]);
+		sdcard_apply_debug_log_config();
 
 		#if HARDWARE_VER == WICAN_PRO
 	imu_wom_settings_t imu_settings;

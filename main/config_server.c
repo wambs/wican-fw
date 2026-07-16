@@ -246,7 +246,7 @@ const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\",\"we
 								\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_en\":\"disable\",\"mqtt_elm327_log\":\"disable\",\"elm327_udp_log\":\"disable\",\"mqtt_url\":\"mqtt://127.0.0.1\",\"mqtt_port\":\"1883\",\
 										\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\",\"mqtt_security\":\"none\",\"mqtt_cert_set\": \"default\",\"mqtt_skip_cn\":\"disable\",\
 										\"mqtt_discovery_en\":\"disable\",\"mqtt_disc_id\":\"wican_pro_equinox\",\"mqtt_disc_path\":\"homeassistant\",\"mqtt_disc_name\":\"My Vehicle\",\"mqtt_disc_model\":\"Generic OBD2\",\"mqtt_disc_mfg\":\"Unknown\",\"mqtt_disc_area\":\"Garage\",\"mqtt_disc_pids_en\":\"disable\",\"mqtt_disc_status_en\":\"disable\",\"mqtt_disc_status_mode\":\"periodic\",\"mqtt_disc_status_period\":\"60\",\
-										\"logger_status\":\"disable\",\"log_filesystem\":\"littlefs\",\"log_storage\":\"sdcard\",\"log_period\":\"10\"}";
+										\"logger_status\":\"disable\",\"log_filesystem\":\"littlefs\",\"log_storage\":\"sdcard\",\"log_period\":\"10\",\"sdcard_debug_log_en\":\"disable\"}";
 
 // const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\", \"ap_auto_disable\": \"disable\",\"sta_ssid\":\"MeatPi\",\"sta_pass\":\"TomatoSauce\",\"sta_security\":\"wpa3\",\"can_datarate\":\"500K\",\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"elm327\",\"ble_pass\":\"123456\",\"ble_status\":\"disable\",\"sleep_status\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"batt_alert\":\"disable\",\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_en\":\"disable\",\"mqtt_elm327_log\":\"disable\",\"mqtt_url\":\"mqtt://127.0.0.1\",\"mqtt_port\":\"1883\",\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\"}";
 // const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\", \"ap_auto_disable\": \"disable\",\"sta_ssid\":\"MeatPi\",\"sta_pass\":\"TomatoSauce\",\"sta_security\":\"wpa3\",\"can_datarate\":\"500K\",\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"elm327\",\"ble_pass\":\"123456\",\"ble_status\":\"disable\",\"sleep_status\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"periodic_wakeup\":\"disable\",\"wakeup_interval\":\"5\",\"batt_alert\":\"disable\",\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_en\":\"disable\",\"mqtt_elm327_log\":\"disable\",\"mqtt_url\":\"mqtt://127.0.0.1\",\"mqtt_port\":\"1883\",\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\"}";
@@ -1922,6 +1922,7 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	cJSON_AddStringToObject(root, "log_filesystem", device_config.log_filesystem);
 	cJSON_AddStringToObject(root, "log_period", device_config.log_period);
 	cJSON_AddStringToObject(root, "log_storage", device_config.log_storage);
+	cJSON_AddStringToObject(root, "sdcard_debug_log_en", device_config.sdcard_debug_log_en);
 	cJSON_AddStringToObject(root, "imu_threshold", device_config.imu_threshold);
 	cJSON_AddStringToObject(root, "imu_wom_x", device_config.imu_wom_x);
 	cJSON_AddStringToObject(root, "imu_wom_y", device_config.imu_wom_y);
@@ -3823,6 +3824,7 @@ static void config_server_load_cfg(char *cfg)
 
 
         // --- HA AUTO DISCOVERY FIELDS ---
+	config_server_load_string(root, "sdcard_debug_log_en", device_config.sdcard_debug_log_en, sizeof(device_config.sdcard_debug_log_en), "enable");
 	config_server_load_string(root, "mqtt_discovery_en", device_config.mqtt_discovery_en, sizeof(device_config.mqtt_discovery_en), "disable");
 	config_server_load_string(root, "mqtt_disc_id", device_config.mqtt_disc_id, sizeof(device_config.mqtt_disc_id), "wican_pro_equinox");
 	config_server_load_string(root, "mqtt_disc_path", device_config.mqtt_disc_path, sizeof(device_config.mqtt_disc_path), "homeassistant");
@@ -4019,6 +4021,10 @@ static void register_server_uris(void)
 	httpd_register_uri_handler(server, &std_pid_info);
 	
 	//Add before this line
+	extern const httpd_uri_t download_log_uri;
+	extern const httpd_uri_t delete_log_uri;
+	httpd_register_uri_handler(server, &download_log_uri);
+	httpd_register_uri_handler(server, &delete_log_uri);
 	httpd_register_uri_handler(server, &obd_logger_ws);
 	httpd_register_uri_handler(server, &db_download_uri);
 	httpd_register_uri_handler(server, &db_files_uri);
@@ -4160,7 +4166,7 @@ static httpd_handle_t config_server_init(void)
                        );
 
 	// Start the httpd server (reserve extra slots for cert manager endpoints)
-	config.max_uri_handlers = 39;
+	config.max_uri_handlers = 45;
 	config.stack_size = (10*1024);
 	config.max_open_sockets = 8;
     ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
@@ -4627,6 +4633,19 @@ int8_t config_server_get_logger_config(void)
 	}
 
 	return -1;
+}
+
+int8_t config_server_get_sdcard_debug_log_en(void)
+{
+	if(strcmp(device_config.sdcard_debug_log_en, "enable") == 0)
+	{
+		return 1;
+	}
+	else if(strcmp(device_config.sdcard_debug_log_en, "disable") == 0)
+	{
+		return 0;
+	}
+	return 1; // default to enabled if unset/corrupt
 }
 
 int8_t config_server_get_ap_auto_disable(void)

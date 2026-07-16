@@ -36,6 +36,21 @@ typedef struct {
 esp_err_t sd_card_init(void);
 
 /**
+ * @brief Apply the sdcard_debug_log_en config setting to SD debug logging
+ *
+ * sd_card_init() runs very early in app_main(), before config.json has been
+ * loaded (config_server_preload_config() runs later) -- so the config-driven
+ * start/stop/delete decision can't be made correctly at mount time. Call this
+ * once, right after config_server_preload_config(), once device_config is
+ * actually populated. No-op (returns ESP_ERR_INVALID_STATE) if the SD card
+ * isn't mounted.
+ *
+ * @return esp_err_t ESP_OK on success (or on a clean disable+delete), error
+ *         code if sdcard_log_start() failed while enabling
+ */
+esp_err_t sdcard_apply_debug_log_config(void);
+
+/**
  * @brief Deinitialize and unmount the SD card
  * 
  * This function unmounts the filesystem and disables the SDMMC peripheral.

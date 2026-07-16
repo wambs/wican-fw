@@ -22,6 +22,7 @@ set(srcs
     "wc_mdns.c"
     "wc_timer.c"
     "sdcard.c"
+    "wican_log_http.c"
     "icm42670.c"
     "imu.c"
     "rtcm.c"

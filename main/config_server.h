@@ -190,6 +190,7 @@ typedef struct _device_config
 	char log_storage[16];
 	char log_filesystem[16];
 	char log_period[16];
+	char sdcard_debug_log_en[16];
 	char imu_threshold[16];
 	char imu_wom_x[10];
 	char imu_wom_y[10];
@@ -291,6 +292,7 @@ int8_t config_server_get_wakeup_time(uint32_t *wakeup_time);
 wifi_security_t config_server_get_sta_security(void);
 int8_t config_server_get_logger_config(void);
 int8_t config_server_get_log_period(uint32_t *log_period);
+int8_t config_server_get_sdcard_debug_log_en(void);
 log_storage_t config_server_get_log_storage(void);
 log_filesystem_t config_server_get_log_filesystem(void);
 int8_t config_server_get_ap_auto_disable(void);

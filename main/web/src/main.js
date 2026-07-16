@@ -243,6 +243,32 @@ function promptProfileSwitch(currentModel, newModel) {
         }
     }
 
+    async function downloadDebugLog() {
+        try {
+            const response = await fetch('/download_log');
+            if (!response.ok) {
+                const text = await response.text().catch(() => '');
+                throw new Error(text || `HTTP ${response.status}`);
+            }
+
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+
+            link.href = url;
+            link.download = 'wican.log';
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            URL.revokeObjectURL(url);
+
+            showNotification('Debug log downloaded.', 'blue', 3000);
+        } catch (error) {
+            console.error('Failed to download debug log:', error);
+            showNotification(`Unable to download debug log. ${error.message}`, 'red');
+        }
+    }
+
     function formatRestartTrackerValue(value, fallback = 'N/A') {
         if (value === undefined || value === null || value === '') {
             return fallback;
@@ -4451,6 +4477,7 @@ async function postConfig() {
     obj["log_filesystem"] = document.getElementById("log_filesystem").value;
     obj["log_storage"] = document.getElementById("log_storage").value;
     obj["log_period"] = document.getElementById("log_period").value;
+    obj["sdcard_debug_log_en"] = document.getElementById("sdcard_debug_log_en").value;
     obj["imu_threshold"] = document.getElementById("imu_threshold").value;
     obj["imu_wom_x"] = document.getElementById("imu_wom_x")?.checked ? "enable" : "disable";
     obj["imu_wom_y"] = document.getElementById("imu_wom_y")?.checked ? "enable" : "disable";
@@ -5118,6 +5145,12 @@ async function Load() {
             document.getElementById("log_storage").selectedIndex = "0";
         } else if (obj.log_storage === "internal") {
             document.getElementById("log_storage").selectedIndex = "1";
+        }
+
+        if (obj.sdcard_debug_log_en === "enable") {
+            document.getElementById("sdcard_debug_log_en").selectedIndex = "0";
+        } else if (obj.sdcard_debug_log_en === "disable") {
+            document.getElementById("sdcard_debug_log_en").selectedIndex = "1";
         }
 
         document.getElementById('log_period_value').textContent = obj.log_period;
