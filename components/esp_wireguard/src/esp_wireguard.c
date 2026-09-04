@@ -248,16 +248,30 @@ fail:
     return err;
 }
 
-esp_err_t esp_wireguard_connect(wireguard_ctx_t *ctx)
+/*
+ * Threading fix: everything below that touches lwIP structures directly
+ * (netif_add/remove, netif_set_default, the UDP PCB and sys_timeout work
+ * done inside wireguardif_init, and WireGuard peer/keypair state shared
+ * with the tcpip thread) must execute in tcpip thread context. This
+ * project builds with CONFIG_LWIP_TCPIP_CORE_LOCKING disabled, so calling
+ * these directly from the vpn_task races the tcpip thread and can corrupt
+ * lwIP state (observed as panics during WireGuard (re)connect shortly
+ * after wake). esp_netif_tcpip_exec() runs a callback synchronously in
+ * tcpip context, which makes the whole chain safe — including everything
+ * netif_add() calls internally.
+ *
+ * Blocking calls (getaddrinfo inside esp_wireguard_peer_init) must stay
+ * OUTSIDE these callbacks: they need the tcpip thread to make progress
+ * and would deadlock if run inside it. That is why peer_init now runs
+ * first, in the calling task, before the marshaled section.
+ */
+
+static esp_err_t wg_connect_in_tcpip_ctx(void *arg)
 {
+    wireguard_ctx_t *ctx = (wireguard_ctx_t *)arg;
     esp_err_t err = ESP_FAIL;
     err_t lwip_err = -1;
     bool created_netif = false;
-
-    if (!ctx) {
-        err = ESP_ERR_INVALID_ARG;
-        goto fail;
-    }
 
     if (ctx->netif == NULL) {
         err = esp_wireguard_netif_create(ctx->config);
@@ -267,17 +281,16 @@ esp_err_t esp_wireguard_connect(wireguard_ctx_t *ctx)
         }
         created_netif = true;
 
-        /* Initialize the first WireGuard peer structure */
-        err = esp_wireguard_peer_init(ctx->config, &peer);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "esp_wireguard_peer_init: %s", esp_err_to_name(err));
-            goto fail;
-        }
-
-        /* Register the new WireGuard peer with the network interface */
+        /* Register the new WireGuard peer with the network interface.
+         * (peer was already initialized by esp_wireguard_peer_init in the
+         * calling task — see esp_wireguard_connect below.) */
         lwip_err = wireguardif_add_peer(wg_netif, &peer, &wg_local_peer_idx);
         if (lwip_err != ERR_OK || wg_local_peer_idx == WIREGUARDIF_INVALID_INDEX) {
             ESP_LOGE(TAG, "wireguardif_add_peer: %i", lwip_err);
+            /* NOTE: the pre-fix code fell through here with err still ESP_OK
+             * (set by the earlier steps), silently reporting success and
+             * skipping cleanup on add_peer failure. Set it explicitly. */
+            err = ESP_FAIL;
             goto fail;
         }
         if (ip_addr_isany(&peer.endpoint_ip)) {
@@ -300,7 +313,7 @@ fail:
     // If we created the netif in this call but failed before ctx->netif was set,
     // clean up the lwIP netif. Otherwise a later retry will hit:
     // assert failed: netif_add (... netif already added)
-    if (err != ESP_OK && created_netif && ctx && ctx->netif == NULL && wg_netif != NULL)
+    if (err != ESP_OK && created_netif && ctx->netif == NULL && wg_netif != NULL)
     {
         // Best-effort cleanup (some steps may fail depending on how far we got)
         if (wg_local_peer_idx != WIREGUARDIF_INVALID_INDEX)
@@ -318,28 +331,47 @@ fail:
     return err;
 }
 
-esp_err_t esp_wireguard_set_default(wireguard_ctx_t *ctx)
+esp_err_t esp_wireguard_connect(wireguard_ctx_t *ctx)
 {
     esp_err_t err;
+
     if (!ctx) {
-        err = ESP_ERR_INVALID_ARG;
-        goto fail;
+        return ESP_ERR_INVALID_ARG;
     }
-    netif_set_default(ctx->netif);
-    err = ESP_OK;
-fail:
-    return err;
+
+    if (ctx->netif == NULL) {
+        /* Initialize the first WireGuard peer structure. Does blocking DNS
+         * (getaddrinfo) — must run here in the calling task, NOT inside
+         * the tcpip context below (would deadlock). */
+        err = esp_wireguard_peer_init(ctx->config, &peer);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_wireguard_peer_init: %s", esp_err_to_name(err));
+            return err;
+        }
+    }
+
+    return esp_netif_tcpip_exec(wg_connect_in_tcpip_ctx, ctx);
 }
 
-esp_err_t esp_wireguard_disconnect(wireguard_ctx_t *ctx)
+static esp_err_t wg_set_default_in_tcpip_ctx(void *arg)
 {
-    esp_err_t err;
-    err_t lwip_err;
+    wireguard_ctx_t *ctx = (wireguard_ctx_t *)arg;
+    netif_set_default(ctx->netif);
+    return ESP_OK;
+}
 
+esp_err_t esp_wireguard_set_default(wireguard_ctx_t *ctx)
+{
     if (!ctx) {
-        err = ESP_ERR_INVALID_ARG;
-        goto fail;
+        return ESP_ERR_INVALID_ARG;
     }
+    return esp_netif_tcpip_exec(wg_set_default_in_tcpip_ctx, ctx);
+}
+
+static esp_err_t wg_disconnect_in_tcpip_ctx(void *arg)
+{
+    wireguard_ctx_t *ctx = (wireguard_ctx_t *)arg;
+    err_t lwip_err;
 
     // Clear the IP address to gracefully disconnect any clients while the
     // peers are still valid
@@ -362,20 +394,21 @@ esp_err_t esp_wireguard_disconnect(wireguard_ctx_t *ctx)
     netif_set_default(ctx->netif_default);
     ctx->netif = NULL;
 
-    err = ESP_OK;
-fail:
-    return err;
+    return ESP_OK;
 }
 
-esp_err_t esp_wireguardif_peer_is_up(wireguard_ctx_t *ctx)
+esp_err_t esp_wireguard_disconnect(wireguard_ctx_t *ctx)
 {
-    esp_err_t err;
-    err_t lwip_err;
-
     if (!ctx) {
-        err = ESP_ERR_INVALID_ARG;
-        goto fail;
+        return ESP_ERR_INVALID_ARG;
     }
+    return esp_netif_tcpip_exec(wg_disconnect_in_tcpip_ctx, ctx);
+}
+
+static esp_err_t wg_peer_is_up_in_tcpip_ctx(void *arg)
+{
+    wireguard_ctx_t *ctx = (wireguard_ctx_t *)arg;
+    err_t lwip_err;
 
     lwip_err = wireguardif_peer_is_up(
             ctx->netif,
@@ -384,10 +417,15 @@ esp_err_t esp_wireguardif_peer_is_up(wireguard_ctx_t *ctx)
             &peer.endport_port);
 
     if (lwip_err != ERR_OK) {
-        err = ESP_FAIL;
-        goto fail;
+        return ESP_FAIL;
     }
-    err = ESP_OK;
-fail:
-    return err;
+    return ESP_OK;
+}
+
+esp_err_t esp_wireguardif_peer_is_up(wireguard_ctx_t *ctx)
+{
+    if (!ctx) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return esp_netif_tcpip_exec(wg_peer_is_up_in_tcpip_ctx, ctx);
 }
