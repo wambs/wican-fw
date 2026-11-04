@@ -297,6 +297,7 @@ esp_err_t autopid_get_protocol_number(int32_t *protocol_value);
 char *autopid_get_value_by_name(char* name);
 bool autopid_supply_mode_is_active(void);
 void autopid_publish_all_destinations(bool is_event_trigger);
+void autopid_publish_last_known(void);
 void autopid_app_reset_timer(void);
 void autopid_set_group_mqtt_state(const char* group_name, bool active_state, uint32_t timeout_mins);
 // Process a raw ELM327 response array (DTCs or ISO-TP) into a dynamic hex string.
