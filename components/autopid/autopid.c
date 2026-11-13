@@ -227,6 +227,9 @@ static char *autopid_build_debug_payload(void)
     return payload;
 }
 
+// Wall-clock time of the last autopid_data snapshot refresh (0 = never).
+static time_t autopid_data_updated_at = 0;
+
 static volatile int32_t s_last_car_on_valid_stamp = -1;
 
 void autopid_pid_update_hook(parameter_t *param, float value) {
@@ -1006,6 +1009,10 @@ static void autopid_data_update(autopid_config_t *pids)
                         }
                     }
                 }
+            }
+            if (root->child)
+            {
+                autopid_data_updated_at = time(NULL);
             }
             autopid_data.json_str = cJSON_PrintUnformatted(root);
             cJSON_Delete(root);
@@ -4120,6 +4127,14 @@ static void publish_parameter_mqtt(parameter_t *param)
         return;
     }
 
+    // Nothing can be delivered while MQTT is offline. Return before touching the
+    // "last sent" history, so on-change values are not marked as sent and lost.
+    // The latest values are published when MQTT reconnects (see
+    // autopid_publish_last_known).
+    if (config_server_mqtt_en_config() != 1 || !mqtt_connected()) {
+        return;
+    }
+
     // Filter: If "onchange" is set, only proceed if value changed
     if (param->onchange)
     {
@@ -4221,6 +4236,221 @@ static void publish_parameter_mqtt(parameter_t *param)
             mqtt_publish(config_server_get_mqtt_rx_topic(), payload, 0, 0, 1);
         }
         free(payload);
+    }
+}
+
+// ==========================================================================================
+// PUBLISH LAST-KNOWN DATA ON MQTT (RE)CONNECT
+// ------------------------------------------------------------------------------------------
+// While the device has no network (e.g. driving away from home Wi-Fi) MQTT publishes are
+// dropped. As soon as MQTT connects again, publish the most recent value of every
+// MQTT-bound parameter so the broker (and Home Assistant) gets current data straight away,
+// even if the car is already off and nothing new can be polled.
+// ==========================================================================================
+
+static bool param_has_value(const parameter_t *param)
+{
+    return param && param->enabled && param->name &&
+           (param->raw_string_value != NULL || param->value != FLT_MAX);
+}
+
+static void add_param_value_to_json(cJSON *obj, const parameter_t *param)
+{
+    if (param->raw_string_value != NULL) {
+        cJSON_AddStringToObject(obj, param->name, param->raw_string_value);
+    } else if (param->sensor_type == BINARY_SENSOR) {
+        cJSON_AddStringToObject(obj, param->name, param->value > 0 ? "on" : "off");
+    } else {
+        cJSON_AddNumberToObject(obj, param->name, param->value);
+    }
+}
+
+static double last_known_timestamp(void)
+{
+    // Prefer the time the data was actually captured; fall back to now if the
+    // clock was not synced at capture time (pre-2020).
+    if (autopid_data_updated_at > 1577836800) {
+        return (double)autopid_data_updated_at;
+    }
+    return (double)time(NULL);
+}
+
+static void mark_param_sent(parameter_t *param)
+{
+    param->last_sent_value = param->value;
+    if (param->raw_string_value != NULL) {
+        if (param->last_sent_raw_string) free(param->last_sent_raw_string);
+        param->last_sent_raw_string = strdup_psram(param->raw_string_value);
+    }
+}
+
+// Publishes and frees obj. Returns true if something was handed to MQTT.
+static bool publish_last_known_json(const char *topic, cJSON *obj)
+{
+    bool sent = false;
+    if (obj && obj->child && topic && topic[0] != '\0') {
+        limitJsonDecimalPrecision(obj);
+        if (config_server_get_mqtt_include_timestamp() == 1) {
+            cJSON_AddNumberToObject(obj, "timestamp", last_known_timestamp());
+        }
+        char *payload = cJSON_PrintUnformatted(obj);
+        if (payload) {
+            mqtt_publish(topic, payload, 0, 0, 1);
+            free(payload);
+            sent = true;
+        }
+    }
+    if (obj) cJSON_Delete(obj);
+    return sent;
+}
+
+static bool grouping_enabled(void)
+{
+    return autopid_config->grouping && strcmp("enable", autopid_config->grouping) == 0;
+}
+
+// Individual-topic parameters (MQTT_Topic / WallBox, and Default when JSON grouping is off).
+// Groups' MQTT_Grp params are handled by the caller; with grouping on, Default params are
+// covered by the snapshot.
+static uint32_t publish_last_known_param(parameter_t *param)
+{
+    if (!param_has_value(param)) return 0;
+    if (param->destination_type == DEST_DEFAULT && grouping_enabled()) return 0;
+
+    const char *topic = (param->destination && param->destination[0] != '\0')
+                            ? param->destination
+                            : config_server_get_mqtt_rx_topic();
+
+    if (param->destination_type == DEST_MQTT_TOPIC || param->destination_type == DEST_DEFAULT) {
+        cJSON *obj = cJSON_CreateObject();
+        if (!obj) return 0;
+        add_param_value_to_json(obj, param);
+        if (publish_last_known_json(topic, obj)) {
+            mark_param_sent(param);
+            return 1;
+        }
+    } else if (param->destination_type == DEST_MQTT_WALLBOX) {
+        char *payload = NULL;
+        if (param->raw_string_value != NULL) {
+            asprintf(&payload, "%s", param->raw_string_value);
+        } else {
+            asprintf(&payload, "%.2f", param->value);
+        }
+        if (payload) {
+            mqtt_publish(topic, payload, 0, 0, 1);
+            free(payload);
+            mark_param_sent(param);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static bool pid_is_in_any_group(const pid_data_t *pid)
+{
+    if (!autopid_config->use_groups) return false;
+    for (uint32_t g = 0; g < autopid_config->group_count; g++) {
+        for (uint32_t gp = 0; gp < autopid_config->groups[g].pid_count; gp++) {
+            if (autopid_config->groups[g].pids[gp] == pid) return true;
+        }
+    }
+    return false;
+}
+
+void autopid_publish_last_known(void)
+{
+    if (!autopid_config || !autopid_config->mutex) return;
+    if (config_server_mqtt_en_config() != 1 || !mqtt_connected()) return;
+
+    uint32_t published = 0;
+
+    // 1. Snapshot of DEST_DEFAULT params -> enabled MQTT group destinations.
+    if (grouping_enabled()) {
+        char *raw_json = autopid_data_read();
+        if (raw_json) {
+            for (uint32_t i = 0; i < autopid_config->destinations_count; i++) {
+                group_destination_t *gd = &autopid_config->destinations[i];
+                if (!gd->enabled) continue;
+                if (gd->type != DEST_MQTT_TOPIC && gd->type != DEST_DEFAULT && gd->type != DEST_MQTT_WALLBOX) continue;
+                const char *topic = (gd->destination && gd->destination[0] != '\0')
+                                        ? gd->destination
+                                        : config_server_get_mqtt_rx_topic();
+                cJSON *snap = cJSON_Parse(raw_json);
+                if (publish_last_known_json(topic, snap)) published++;
+            }
+            heap_caps_free(raw_json);
+        }
+    }
+
+    // 2. Per-parameter topics and group bulk topics. Needs the config lock; the poller can
+    // hold it for a full cycle, so wait a while instead of giving up immediately.
+    if (xSemaphoreTake(autopid_config->mutex, pdMS_TO_TICKS(30000)) != pdTRUE) {
+        ESP_LOGW(TAG, "Publish-on-connect: config busy, sent snapshot only (%lu msgs)", (unsigned long)published);
+        return;
+    }
+
+    if (autopid_config->use_groups) {
+        for (uint32_t g = 0; g < autopid_config->group_count; g++) {
+            pid_group_t *group = &autopid_config->groups[g];
+            if (!group->enabled) continue;
+            bool has_group_topic = group->mqtt_topic && group->mqtt_topic[0] != '\0';
+            cJSON *grp_json = has_group_topic ? cJSON_CreateObject() : NULL;
+
+            for (uint32_t i = 0; i < group->pid_count; i++) {
+                pid_data_t *pid = group->pids[i];
+                if (!pid || !pid->enabled) continue;
+                for (uint32_t p = 0; p < pid->parameters_count; p++) {
+                    parameter_t *param = &pid->parameters[p];
+                    if (param->destination_type == DEST_MQTT_GRP) {
+                        if (grp_json && param_has_value(param)) {
+                            add_param_value_to_json(grp_json, param);
+                            mark_param_sent(param);
+                        }
+                    } else {
+                        published += publish_last_known_param(param);
+                    }
+                }
+            }
+            if (publish_last_known_json(has_group_topic ? group->mqtt_topic : NULL, grp_json)) published++;
+        }
+    }
+
+    for (uint32_t i = 0; i < autopid_config->pid_count; i++) {
+        pid_data_t *pid = &autopid_config->pids[i];
+        if (!pid->enabled || pid_is_in_any_group(pid)) continue;
+        for (uint32_t p = 0; p < pid->parameters_count; p++) {
+            published += publish_last_known_param(&pid->parameters[p]);
+        }
+    }
+
+    for (uint32_t fi = 0; fi < autopid_config->can_filters_count; fi++) {
+        can_filter_t *f = &autopid_config->can_filters[fi];
+        for (uint32_t p = 0; p < f->parameters_count; p++) {
+            published += publish_last_known_param(&f->parameters[p]);
+        }
+    }
+
+    xSemaphoreGive(autopid_config->mutex);
+    ESP_LOGI(TAG, "Publish-on-connect: sent %lu last-known message(s)", (unsigned long)published);
+}
+
+// Watches for MQTT connecting (rising edge) and publishes the last-known data once.
+static void autopid_mqtt_connect_publish_task(void *pvParameters)
+{
+    for (;;) {
+        dev_status_wait_for_bits(DEV_MQTT_CONNECTED_BIT, portMAX_DELAY);
+
+        // Let the MQTT client finish its own on-connect work (status, subscriptions).
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        if (dev_status_is_mqtt_connected()) {
+            ESP_LOGI(TAG, "MQTT connected, publishing last-known data");
+            autopid_publish_last_known();
+        }
+
+        // Wait for the disconnect before arming again.
+        while (dev_status_is_mqtt_connected()) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
     }
 }
 
@@ -5203,7 +5433,9 @@ if (any_param_enabled) {
                     // ==========================================================================================
                     // [NEW] AGGREGATE AND PUBLISH MQTT_GRP AS ONE BULK MESSAGE
                     // ==========================================================================================
-                    if (group->mqtt_topic && strlen(group->mqtt_topic) > 0) {
+                    // Skip while MQTT is offline so on-change history is not updated
+                    // for values that were never delivered.
+                    if (group->mqtt_topic && strlen(group->mqtt_topic) > 0 && mqtt_connected()) {
                         cJSON *grp_json = NULL;
                         bool has_data = false;
 
@@ -5585,6 +5817,18 @@ void autopid_init(char *id, bool enable_logging, uint32_t logging_period)
         }
     }
 
+
+    // Publish the most recent data as soon as MQTT (re)connects, e.g. on reaching home Wi-Fi.
+    {
+        static StackType_t *mqtt_connect_task_stack;
+        static StaticTask_t mqtt_connect_task_buffer;
+        static const size_t mqtt_connect_task_stack_depth = (1024 * 6);
+        mqtt_connect_task_stack = heap_caps_malloc(mqtt_connect_task_stack_depth, MALLOC_CAP_SPIRAM);
+        if (mqtt_connect_task_stack == NULL) { ESP_LOGE(TAG, "Failed to allocate mqtt connect publish task stack"); }
+        else if (xTaskCreateStatic(autopid_mqtt_connect_publish_task, "ap_mqtt_conn", (uint32_t)mqtt_connect_task_stack_depth, NULL, 5, mqtt_connect_task_stack, &mqtt_connect_task_buffer) == NULL) {
+            ESP_LOGE(TAG, "Failed to create mqtt connect publish task");
+        }
+    }
 
     /* [NEW] Allocate memory and create the Processing Task (Lower Priority: 5) */
    uint32_t proc_stack_depth = 1024 * 12;
